@@ -1,0 +1,724 @@
+<Readers>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnTarget"
+			Name="Clear ImportedWMIEvidence"
+			Order="800"
+			Retries="1">
+		IF OBJECT_ID('dbo.ImportedWMIEvidence') IS NOT NULL
+			BEGIN
+				DELETE dbo.ImportedWMIEvidence
+				WHERE ComplianceConnectionID = @ComplianceConnectionID
+			END
+		
+		PRINT N'Removed ' + CONVERT(NVARCHAR(1000), @@ROWCOUNT) + N' WMI Evidence records in ImportedWMIEvidence staging table   '
+
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnSource"
+			Name="CreateSMSWMIEvidenceIDTable"
+			Order="810"
+			Retries="1"
+			VersionBefore="5.0">
+		<![CDATA[
+		IF OBJECT_ID('tempdb..#SMSWMIEvidence') IS NOT NULL
+		BEGIN
+			drop table #SMSWMIEvidence
+		END
+
+		CREATE TABLE #SMSWMIEvidence
+		(
+			ClassName nvarchar(256) COLLATE database_default,
+			PropertyName nvarchar(256) COLLATE database_default,
+			PropertyValue nvarchar(256)  COLLATE database_default,
+			ExternalID int identity(1,1)
+		)
+
+		CREATE CLUSTERED INDEX IX_#SMSWMIEvidence ON #SMSWMIEvidence(ClassName, PropertyName, PropertyValue)
+
+		IF OBJECT_ID('tempdb..#SortedOsData') IS NOT NULL
+				DROP TABLE #SortedOsData
+
+		IF OBJECT_ID('tempdb..#Latest_Operating_System_Data') IS NOT NULL
+			DROP TABLE #Latest_Operating_System_Data
+
+		CREATE TABLE #Latest_Operating_System_Data
+		(
+			MachineID int
+			Name nvarchar(256) COLLATE database_default,
+			Caption nvarchar(256)  COLLATE database_default,
+			Manufacturer nvarchar(256)  COLLATE database_default,
+			Version nvarchar(256)  COLLATE database_default,
+			CSDVersion nvarchar(256)  COLLATE database_default,
+		)
+
+		
+		SELECT
+			MachineID, 
+			Name0, 
+			Caption0,
+			Manufacturer0,
+			Version0, 
+			CSDVersion0,
+			IDENTITY(int) AS RowNum
+		INTO #SortedOsData
+		FROM Operating_System_Data osd
+		ORDER BY MachineID,  osd.TimeKey DESC, osd.InstallDate0 DESC
+
+		CREATE CLUSTERED INDEX IDX_SortedOsData_MachineID_RowNum ON #SortedOsData(MachineID,RowNum)
+
+		INSERT INTO #Latest_Operating_System_Data(MachineID, Name, Manufacturer, Caption, Version, CSDVersion)
+		SELECT 
+			s.MachineID,
+			s.Name0,
+			s.Caption0,
+			s.Manufacturer0,
+			s.Version0,
+			s.CSDVersion0
+		FROM #SortedOsData s
+		INNER JOIN (
+			SELECT 
+				MachineID, 
+				MIN(RowNum) AS MostRecent 
+			FROM #SortedOsData 
+			GROUP BY MachineID
+		) AS s2
+			ON s.MachineID = s2.MachineID 
+			AND s.RowNum = s2.MostRecent
+
+		-- Capture WMI OS information from SMS
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Name' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Name) > 0
+			THEN
+				SUBSTRING(osd.Name, 1, CHARINDEX('|', osd.Name)-1)
+			ELSE
+				osd.Name
+			END)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Name IS NOT NULL
+		
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Caption' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.Caption)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Caption IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Manufacturer' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.Manufacturer)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Manufacturer IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Version' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.Version)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Version IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'CSDVersion' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.CSDVersion)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.CSDVersion IS NOT NULL
+	-- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    -- BEGIN Customised SCCM reader to import SQL WMI data 
+	  IF EXISTS (SELECT 'x' FROM information_schema.tables WHERE TABLE_NAME = 'FNMP_SQLServer_DATA')
+	  BEGIN
+		  INSERT #SMSWMIEvidence (ClassName,PropertyName,PropertyValue)
+		  SELECT DISTINCT ClassName,PropertyName,PropertyValue 
+		  FROM (
+			  SELECT DISTINCT
+				  'MGS_SQLService' as ClassName,				  
+				  PropertyName00 as PropertyName,
+				  CASE PropertyValueType00
+					  WHEN 0 THEN PropertyStrValue00
+					  ELSE CAST(PropertyNumValue00 as nvarchar(64))
+				  END as PropertyValue,
+				  MachineID
+			  FROM FNMP_SQLServer_DATA
+			  --WHERE PropertyName00 in ('FILEVERSION', 'SKU', 'ISWOW64')
+			  UNION
+			  SELECT distinct
+				  'MGS_SQLService' as ClassName,
+				  'SQLServiceType' as PropertyName,
+				  CAST(SqlServiceType00 as nvarchar(64)) as PropertyValue,
+				  MachineID
+			  FROM FNMP_SQLServer_DATA
+		  ) as SMSWMIEvidenceSQL
+		  WHERE 
+			PropertyName IS NOT NULL
+			AND PropertyValue IS NOT NULL
+		END
+    -- END Customised SCCM reader to import SQL WMI data 
+    -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+		-- Augment SQL WMI classes with extra details from SMS registry scanning etc. here
+
+		DECLARE @InsertedWMIEvidenceCount BIGINT
+		SELECT @InsertedWMIEvidenceCount = COUNT(*) FROM #SMSWMIEvidence
+		PRINT N'Found ' + CONVERT(NVARCHAR(1000), @InsertedWMIEvidenceCount) + N' WMI Evidence records in the source database'
+	
+					]]>
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnSource"
+			Name="CreateSMSWMIEvidenceIDTable"
+			Order="820"
+			Retries="1"
+			VersionFrom="5.0">
+		<![CDATA[
+		IF OBJECT_ID('tempdb..#SMSWMIEvidence') IS NOT NULL
+		BEGIN
+			drop table #SMSWMIEvidence
+		END
+
+		CREATE TABLE #SMSWMIEvidence
+		(
+			ClassName nvarchar(256) COLLATE database_default,
+			PropertyName nvarchar(256) COLLATE database_default,
+			PropertyValue nvarchar(256)  COLLATE database_default,
+			ExternalID int identity(1,1)
+		)
+
+		CREATE CLUSTERED INDEX IX_#SMSWMIEvidence ON #SMSWMIEvidence(ClassName, PropertyName, PropertyValue)
+
+		IF OBJECT_ID('tempdb..#Latest_Operating_System_Data') IS NOT NULL
+			DROP TABLE #Latest_Operating_System_Data
+
+		CREATE TABLE #Latest_Operating_System_Data
+		(
+			MachineID int
+			Name nvarchar(256) COLLATE database_default,
+			Caption nvarchar(256)  COLLATE database_default,
+			Manufacturer nvarchar(256)  COLLATE database_default,
+			Version nvarchar(256)  COLLATE database_default,
+			CSDVersion nvarchar(256)  COLLATE database_default,
+		)
+
+		INSERT INTO #Latest_Operating_System_Data(MachineID, Name, Manufacturer, Caption, Version, CSDVersion)
+		SELECT TOP 1 WITH TIES
+			MachineID, 
+			Name00, 
+			Caption00,
+			Manufacturer00,
+			Version00, 
+			CSDVersion00
+		FROM Operating_System_Data osd
+		ORDER BY ROW_NUMBER() OVER(PARTITION BY osd.MachineID ORDER BY osd.TimeKey DESC, osd.InstallDate00 DESC)
+
+		-- Capture WMI OS information from SMS
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Name' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Name ) > 0
+			THEN
+				SUBSTRING(osd.Name, 1, CHARINDEX('|', osd.Name)-1)
+			ELSE
+				osd.Name
+			END)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Name IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Caption' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.Caption)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Caption IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Manufacturer' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.Manufacturer)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Manufacturer IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'Version' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.Version)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.Version IS NOT NULL
+
+		INSERT #SMSWMIEvidence	(ClassName,PropertyName,PropertyValue)
+		SELECT DISTINCT
+			'Win32_OperatingSystem' AS ClassName,
+			'CSDVersion' AS PropertyName,
+			SUBSTRING(rtrim(ltrim(osd.CSDVersion)), 1, 256) AS PropertyValue
+		FROM #Latest_Operating_System_Data AS osd
+		WHERE osd.CSDVersion IS NOT NULL
+
+  -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    -- BEGIN Customised SCCM reader to import SQL WMI data 
+	  IF EXISTS (SELECT 'x' FROM information_schema.tables WHERE TABLE_NAME = 'FNMP_SQLServer_DATA')
+	  BEGIN
+		  INSERT #SMSWMIEvidence (ClassName,PropertyName,PropertyValue)
+		  SELECT DISTINCT ClassName,PropertyName,PropertyValue 
+		  FROM (
+			  SELECT DISTINCT
+				  'MGS_SQLService' as ClassName,
+				  PropertyName00 as PropertyName,
+				  CASE PropertyValueType00
+					  WHEN 0 THEN PropertyStrValue00
+					  ELSE CAST(PropertyNumValue00 as nvarchar(64))
+				  END as PropertyValue,
+				  MachineID
+			  FROM FNMP_SQLServer_DATA
+			  --WHERE PropertyName00 in ('FILEVERSION', 'SKU', 'ISWOW64')
+			  UNION
+			  SELECT distinct
+				  'MGS_SQLService' as ClassName,
+				  'SQLServiceType' as PropertyName,
+				  CAST(SqlServiceType00 as nvarchar(64)) as PropertyValue,
+				  MachineID
+			  FROM FNMP_SQLServer_DATA
+		  ) as SMSWMIEvidenceSQL
+		  WHERE 
+			PropertyName IS NOT NULL
+			AND PropertyValue IS NOT NULL
+		END
+    -- END Customised SCCM reader to import SQL WMI data 
+    -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+		
+		-- Augment SQL WMI classes with extra details from SMS registry scanning etc. here
+
+		DECLARE @InsertedWMIEvidenceCount BIGINT
+		SELECT @InsertedWMIEvidenceCount = COUNT(*) FROM #SMSWMIEvidence
+		PRINT N'Found ' + CONVERT(NVARCHAR(1000), @InsertedWMIEvidenceCount) + N' WMI Evidence records in the source database'
+		
+					]]>
+	</Reader>
+	<!--In order to return only the WMI evidence which is required for Compliance Manager, we need to create a couple of 
+	temporary tables on the source ManageSoft database.-->
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnSource"
+			Name="CreateApplicationWMITempTables"
+			Order="830"
+			Retries="1">
+		IF OBJECT_ID('tempdb..#ApplicationWMI') IS NOT NULL
+		DROP TABLE #ApplicationWMI
+		CREATE TABLE #ApplicationWMI
+		(
+		ClassName nvarchar(50) COLLATE database_default,
+		PropertyName nvarchar(50) COLLATE database_default
+		)
+		
+		PRINT N'Created temporary working tables in the source database needed for succeeding operations'
+	</Reader>
+	<!--Transfer the WMI names used in the Compliance Manager ARL to the #ApplicationWMI temporary table on the source
+	database.-->
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="TargetToSource"
+			Name="InsertIntoWMITempApplicationFile"
+			Order="840"
+			Retries="1"
+			Table="#ApplicationWMI">
+		<![CDATA[
+				SELECT distinct we.ClassName, we.PropertyName
+				FROM dbo.WMIEvidence as we
+				JOIN dbo.SoftwareTitleWMIEvidence as stwe
+					ON we.WMIEvidenceID = stwe.WMIEvidenceID
+			]]>
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="SourceToTarget"
+			Name="WMIEvidencePrimaryRead"
+			Table="ImportedWMIEvidence"
+			Order="850"
+			Retries="1">
+		<![CDATA[
+		SELECT
+			@ComplianceConnectionID AS ComplianceConnectionID,
+			we.ClassName,
+			we.PropertyName,
+			we.PropertyValue,
+			we.ExternalID AS ExternalEvidenceID
+		FROM	#SMSWMIEvidence	AS we
+		INNER JOIN #ApplicationWMI e ON e.ClassName like LEFT(we.ClassName, 50)
+			AND e.PropertyName like LEFT(we.PropertyName, 50)
+					]]>
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="SourceToTarget"
+			Name="WMIEvidenceOptionalRead"
+			Table="ImportedWMIEvidence"
+			Order="860"
+			Retries="1"
+			Optional="true">
+		<![CDATA[
+		SELECT
+			@ComplianceConnectionID AS ComplianceConnectionID,
+			we.ClassName,
+			we.PropertyName,
+			we.PropertyValue,
+			we.ExternalID AS ExternalEvidenceID
+		FROM	#SMSWMIEvidence	AS we
+		WHERE NOT EXISTS (SELECT 1 FROM #ApplicationWMI e WHERE e.ClassName like LEFT(we.ClassName, 50)
+			AND e.PropertyName like LEFT(we.PropertyName, 50))
+					]]>
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnTarget"
+			Name="Target Setup: Clear the ImportedInstalledWMIEvidence table"
+			Order="870"
+			Retries="1">
+		IF OBJECT_ID('ImportedInstalledWMIEvidence') IS NOT NULL
+		BEGIN
+			delete ImportedInstalledWMIEvidence
+			WHERE ComplianceConnectionID = @ComplianceConnectionID
+		END
+
+		PRINT N'Removed ' + CONVERT(NVARCHAR(1000), @@ROWCOUNT) + N' WMI Evidence installation records in ImportedInstalledWMIEvidence staging table'
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnSource"
+			Name="Create a local table matching ComputerID to EvidenceID"
+			Order="880"
+			Retries="1"
+			VersionBefore="5.0">
+		IF OBJECT_ID('tempdb..#SMSInstalledWMIEvidence') IS NOT NULL
+		BEGIN
+		drop table #SMSInstalledWMIEvidence
+		END
+
+		CREATE TABLE #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID int,
+		ExternalComputerID int,
+		InstanceName nvarchar(256) COLLATE database_default
+		)
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM #Latest_Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Name) > 0
+		THEN
+		SUBSTRING(osd.Name, 1, CHARINDEX('|', osd.Name)-1)
+		ELSE
+		osd.Name
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Caption0) > 0
+		THEN
+		SUBSTRING(osd.Caption0, 1, CHARINDEX('|', osd.Caption0)-1)
+		ELSE
+		osd.Caption0
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Version0) > 0
+		THEN
+		SUBSTRING(osd.Version0, 1, CHARINDEX('|', osd.Version0)-1)
+		ELSE
+		osd.Version0
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.CSDVersion0) > 0
+		THEN
+		SUBSTRING(osd.CSDVersion0, 1, CHARINDEX('|', osd.CSDVersion0)-1)
+		ELSE
+		osd.CSDVersion0
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Manufacturer0) > 0
+		THEN
+		SUBSTRING(osd.Manufacturer0, 1, CHARINDEX('|', osd.Manufacturer0)-1)
+		ELSE
+		osd.Manufacturer0
+		END)), 1, 256)))
+
+    -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    -- BEGIN Customised SCCM reader to import SQL WMI data
+    IF EXISTS (SELECT 'x' FROM information_schema.tables WHERE TABLE_NAME = 'FNMP_SQLServer_DATA')
+    BEGIN
+		INSERT #SMSInstalledWMIEvidence (ExternalComputerID,ExternalEvidenceID, InstanceName)
+		SELECT i.MachineID,ev.ExternalID, i.InstanceName
+		FROM (
+			SELECT DISTINCT
+			  'MGS_SQLService' as ClassName,
+			  SUBSTRING(rtrim(ltrim(ServiceName00)), 1, 256) as InstanceName,
+			  PropertyName00 as PropertyName,
+			  CASE PropertyValueType00
+				WHEN 0 THEN PropertyStrValue00
+				ELSE CAST(PropertyNumValue00 as nvarchar(64))
+			  END as PropertyValue,
+			  MachineID
+			FROM FNMP_SQLServer_DATA
+			UNION
+			SELECT distinct
+			  'MGS_SQLService' as ClassName,
+			  SUBSTRING(rtrim(ltrim(ServiceName00)), 1, 256) as InstanceName,
+			  'SQLServiceType' as PropertyName,
+			  CAST(SqlServiceType00 as nvarchar(64)) as PropertyValue,
+			  MachineID
+			FROM FNMP_SQLServer_DATA
+		  ) as i
+			JOIN #SMSWMIEvidence ev on ev.PropertyName = i.PropertyName and ev.PropertyValue = i.PropertyValue
+		 WHERE
+			  i.PropertyName IS NOT NULL
+			  AND i.PropertyValue IS NOT NULL
+
+	END 
+	-- Customised SCCM reader to import SQL WMI data
+    -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+		DECLARE @InsertedInstalledWMIEvidenceCount BIGINT
+		SELECT @InsertedInstalledWMIEvidenceCount = COUNT(*) FROM #SMSInstalledWMIEvidence
+		PRINT N'Found ' + CONVERT(NVARCHAR(1000), @InsertedInstalledWMIEvidenceCount) + N' WMI Evidence installation records in the source database'
+		
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnSource"
+			Name="Create a local table matching ComputerID to EvidenceID"
+			Order="890"
+			Retries="1"
+			VersionFrom="5.0">
+		IF OBJECT_ID('tempdb..#SMSInstalledWMIEvidence') IS NOT NULL
+		BEGIN
+		drop table #SMSInstalledWMIEvidence
+		END
+
+		CREATE TABLE #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID int,
+		ExternalComputerID int,
+		InstanceName nvarchar(256) COLLATE database_default
+		)
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Name00) > 0
+		THEN
+		SUBSTRING(osd.Name00, 1, CHARINDEX('|', osd.Name00)-1)
+		ELSE
+		osd.Name00
+		END)), 1, 256)))		
+		
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Caption00) > 0
+		THEN
+		SUBSTRING(osd.Caption00, 1, CHARINDEX('|', osd.Caption00)-1)
+		ELSE
+		osd.Caption00
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Version00) > 0
+		THEN
+		SUBSTRING(osd.Version00, 1, CHARINDEX('|', osd.Version00)-1)
+		ELSE
+		osd.Version00
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.CSDVersion00) > 0
+		THEN
+		SUBSTRING(osd.CSDVersion00, 1, CHARINDEX('|', osd.CSDVersion00)-1)
+		ELSE
+		osd.CSDVersion00
+		END)), 1, 256)))
+
+		INSERT #SMSInstalledWMIEvidence
+		(
+		ExternalEvidenceID,
+		ExternalComputerID,
+		InstanceName
+		)
+		SELECT
+		ev.ExternalID,
+		MachineID,
+		ev.PropertyValue AS InstanceName
+		FROM Operating_System_Data AS osd
+		INNER JOIN #SMSWMIEvidence AS ev
+		ON (ev.PropertyValue = CONVERT(nvarchar(256), SUBSTRING(rtrim(ltrim(CASE WHEN CHARINDEX('|', osd.Manufacturer00) > 0
+		THEN
+		SUBSTRING(osd.Manufacturer00, 1, CHARINDEX('|', osd.Manufacturer00)-1)
+		ELSE
+		osd.Manufacturer00
+		END)), 1, 256)))
+    -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    -- BEGIN Customised SCCM reader to import SQL WMI data
+    IF EXISTS (SELECT 'x' FROM information_schema.tables WHERE TABLE_NAME = 'FNMP_SQLServer_DATA')
+    BEGIN
+		INSERT #SMSInstalledWMIEvidence (ExternalComputerID,ExternalEvidenceID, InstanceName)
+		SELECT i.MachineID,ev.ExternalID, i.InstanceName
+		FROM (
+			SELECT DISTINCT
+			  'MGS_SQLService' as ClassName,
+			   SUBSTRING(rtrim(ltrim(ServiceName00)), 1, 256) as InstanceName,
+			  PropertyName00 as PropertyName,
+			  CASE PropertyValueType00
+				WHEN 0 THEN PropertyStrValue00
+				ELSE CAST(PropertyNumValue00 as nvarchar(64))
+			  END as PropertyValue,
+			  MachineID
+			FROM FNMP_SQLServer_DATA
+			UNION
+			SELECT distinct
+			  'MGS_SQLService' as ClassName,
+			   SUBSTRING(rtrim(ltrim(ServiceName00)), 1, 256) as InstanceName,
+			  'SQLServiceType' as PropertyName,
+			  CAST(SqlServiceType00 as nvarchar(64)) as PropertyValue,
+			  MachineID
+			FROM FNMP_SQLServer_DATA
+		  ) as i
+			JOIN #SMSWMIEvidence ev on ev.PropertyName = i.PropertyName and ev.PropertyValue = i.PropertyValue
+		 WHERE
+			  i.PropertyName IS NOT NULL
+			  AND i.PropertyValue IS NOT NULL
+
+	END
+	-- END Customised SCCM reader to import SQL WMI data
+    -- +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	
+	
+		DECLARE @InsertedInstalledWMIEvidenceCount BIGINT
+		SELECT @InsertedInstalledWMIEvidenceCount = COUNT(*) FROM #SMSInstalledWMIEvidence
+		PRINT N'Found ' + CONVERT(NVARCHAR(1000), @InsertedInstalledWMIEvidenceCount) + N' WMI Evidence installation records in the source database'
+
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="SourceToTarget"
+			Name="InstalledWMIEvidencePrimaryRead"
+			Table="ImportedInstalledWMIEvidence"
+			Order="900"
+			Retries="1">
+			SELECT
+				@ComplianceConnectionID AS ComplianceConnectionID, 
+				iwe.ExternalComputerID,
+				iwe.ExternalEvidenceID,
+				iwe.InstanceName
+			FROM	#SMSInstalledWMIEvidence	AS iwe
+	</Reader>
+	<Reader xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+			xsi:type="ExecuteOnSource"
+			Name="CleanupInstallerTemporaryTablesOnSource"
+			Order="910"
+			Retries="1">
+		IF OBJECT_ID('tempdb..#SMSWMIEvidence') IS NOT NULL
+			drop table #SMSWMIEvidence
+
+		IF OBJECT_ID('tempdb..#ApplicationWMI') IS NOT NULL
+			DROP TABLE #ApplicationWMI
+
+		IF OBJECT_ID('tempdb..#SMSInstalledWMIEvidence') IS NOT NULL
+			drop table #SMSInstalledWMIEvidence
+			
+		PRINT N'Removed temporary working tables in the source database'
+
+	</Reader>
+</Readers>
